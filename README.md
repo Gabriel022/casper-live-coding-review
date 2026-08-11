@@ -121,3 +121,11 @@ These files were generated from the preserved original repository before this re
 The complete original July 14 repository, including its .git directory and final uncommitted interview working tree, has been preserved separately.
 
 That archive is being provided separately so the original evidence remains distinct from this convenience review copy.
+
+## Re-validation
+
+On August 11, 2026, I created a fresh Python virtual environment from requirements.txt and reran the preserved test suite:
+
+3 tests passed using Python 3.12.3 and pytest 9.1.1.
+
+This re-validation was performed on the review copy and did not modify the preserved July 14 interview repository.
