@@ -81,7 +81,7 @@ tests_main.py contains focused tests for important boundaries in the system:
 
 Run the tests with:
 
-pytest -v
+pytest -v tests_main.py
 
 ## Runtime evidence
 
