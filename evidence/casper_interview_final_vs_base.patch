@@ -1,0 +1,1363 @@
+diff --git a/main.py b/main.py
+index e69de29..84f6ff5 100644
+--- a/main.py
++++ b/main.py
+@@ -0,0 +1,651 @@
++"""Hacker News "Research Brief" generator.
++
++An LLM-backed pipeline that turns the Hacker News front page into a grounded,
++evidence-based research brief. The flow follows a strict layered architecture:
++
++    Discovery  -> Candidate Filtering -> Article Extraction -> Record Validation
++    -> LLM Analysis -> Application Validation -> Terminal report + Markdown artifact
++
++Each layer has a narrow responsibility and a well-defined data contract so the
++stages can be tested and reasoned about in isolation.
++"""
++
++from __future__ import annotations
++
++import datetime as _dt
++import json
++import os
++import re
++import sys
++from urllib.parse import urljoin, urlparse
++
++import requests
++import trafilatura
++from bs4 import BeautifulSoup
++from dotenv import load_dotenv
++from openai import OpenAI
++from pydantic import BaseModel, Field, ValidationError
++
++# --------------------------------------------------------------------------- #
++# Configuration constants
++# --------------------------------------------------------------------------- #
++HN_BASE_URL = "https://news.ycombinator.com/"
++HN_HOST = "news.ycombinator.com"
++DEFAULT_MODEL = "gpt-4o-mini"
++USER_AGENT = (
++    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
++    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36 ResearchBrief/1.0"
++)
++REQUEST_TIMEOUT = 15
++MAX_ARTICLES = 3
++MIN_CONTENT_CHARS = 250
++MAX_CHARS_PER_ARTICLE = 6000
++OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
++SEEN_PATH = os.path.join(OUTPUT_DIR, "seen_articles.json")
++
++
++# --------------------------------------------------------------------------- #
++# Data models (contracts between layers)
++# --------------------------------------------------------------------------- #
++class HackerNewsArticleMetadata(BaseModel):
++    """Metadata scraped from a single Hacker News front-page row."""
++
++    source_id: str
++    rank: int
++    title: str
++    url: str  # absolute link to the article (external) or HN item (internal)
++    author: str | None = None
++    points: int | None = None
++    comments: int | None = None
++    hn_url: str  # absolute link to the HN discussion
++
++
++class ArticleContent(BaseModel):
++    """Main textual content extracted from an external article page."""
++
++    source_id: str
++    title: str
++    url: str
++    text: str
++
++
++class ArticleInsight(BaseModel):
++    """Structured, evidence-backed insights for a single article."""
++
++    source_id: str
++    title: str
++    url: str = ""
++    summary: str = ""
++    key_points: list[str] = Field(default_factory=list)
++    sentiment: str = "neutral"
++    evidence: list[str] = Field(default_factory=list)
++
++
++class ResearchBrief(BaseModel):
++    """The complete LLM-generated brief across the analysed article set."""
++
++    insights: list[ArticleInsight] = Field(default_factory=list)
++    overall_summary: str = ""
++    cross_article_synthesis: str = ""
++
++
++# --------------------------------------------------------------------------- #
++# Small helpers
++# --------------------------------------------------------------------------- #
++def _parse_int(text: str) -> int | None:
++    """Extract the first integer found in ``text`` (handling thousands commas)."""
++    if not text:
++        return None
++    match = re.search(r"\d[\d,]*", text)
++    return int(match.group().replace(",", "")) if match else None
++
++
++def _strip_code_fence(text: str) -> str:
++    """Remove a leading/trailing Markdown code fence from an LLM response."""
++    text = text.strip()
++    if text.startswith("```"):
++        text = re.sub(r"^```[a-zA-Z0-9]*\s*", "", text)
++        text = re.sub(r"\s*```$", "", text)
++    return text.strip()
++
++
++# --------------------------------------------------------------------------- #
++# Discovery layer: HN front page -> List[HackerNewsArticleMetadata]
++# --------------------------------------------------------------------------- #
++def fetch_frontpage(url: str = HN_BASE_URL) -> str:
++    """Fetch the raw HTML of the Hacker News front page."""
++    response = requests.get(
++        url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT}
++    )
++    response.raise_for_status()
++    return response.text
++
++
++def parse_frontpage(html: str) -> list[HackerNewsArticleMetadata]:
++    """Parse front-page HTML into structured article metadata records."""
++    soup = BeautifulSoup(html, "html.parser")
++    articles: list[HackerNewsArticleMetadata] = []
++
++    for row in soup.select("tr.athing"):
++        source_id = (row.get("id") or "").strip()
++
++        rank_el = row.select_one(".rank")
++        rank = _parse_int(rank_el.get_text()) if rank_el else None
++
++        title_link = row.select_one("span.titleline > a") or row.select_one(
++            "td.title a"
++        )
++        if not title_link:
++            continue
++
++        title = title_link.get_text(strip=True)
++        href = (title_link.get("href") or "").strip()
++        url = urljoin(HN_BASE_URL, href)
++        hn_url = (
++            urljoin(HN_BASE_URL, f"item?id={source_id}") if source_id else HN_BASE_URL
++        )
++
++        author: str | None = None
++        points: int | None = None
++        comments: int | None = None
++
++        subtext_row = row.find_next_sibling("tr")
++        subtext = subtext_row.select_one("td.subtext") if subtext_row else None
++        if subtext:
++            score_el = subtext.select_one("span.score")
++            if score_el:
++                points = _parse_int(score_el.get_text())
++
++            user_el = subtext.select_one("a.hnuser")
++            if user_el:
++                author = user_el.get_text(strip=True)
++
++            for anchor in subtext.select("a"):
++                label = anchor.get_text(strip=True).lower()
++                if "comment" in label:
++                    comments = _parse_int(label) or 0
++                elif label == "discuss":
++                    comments = 0
++
++        articles.append(
++            HackerNewsArticleMetadata(
++                source_id=source_id,
++                rank=rank if rank is not None else 0,
++                title=title,
++                url=url,
++                author=author,
++                points=points,
++                comments=comments,
++                hn_url=hn_url,
++            )
++        )
++
++    return articles
++
++
++# --------------------------------------------------------------------------- #
++# Candidate filtering: keep external HTTP/HTTPS links only
++# --------------------------------------------------------------------------- #
++def filter_external(
++    articles: list[HackerNewsArticleMetadata],
++) -> list[HackerNewsArticleMetadata]:
++    """Return only articles that point to an external http/https destination."""
++    external: list[HackerNewsArticleMetadata] = []
++    for article in articles:
++        parsed = urlparse(article.url)
++        if parsed.scheme in ("http", "https") and parsed.netloc.lower() != HN_HOST:
++            external.append(article)
++    return external
++
++
++# --------------------------------------------------------------------------- #
++# Deduplication: skip candidates already processed on previous runs
++# --------------------------------------------------------------------------- #
++def load_seen_ids(path: str = SEEN_PATH) -> set[str]:
++    """Load the set of Hacker News source IDs processed on previous runs.
++
++    Returns an empty set when the file is missing or unreadable, so a fresh
++    checkout simply behaves as if nothing has been seen yet.
++    """
++    try:
++        with open(path, "r", encoding="utf-8") as handle:
++            data = json.load(handle)
++    except (FileNotFoundError, json.JSONDecodeError, OSError):
++        return set()
++    raw = data.get("seen", []) if isinstance(data, dict) else data
++    return {str(item) for item in raw}
++
++
++def save_seen_ids(seen: set[str], path: str = SEEN_PATH) -> None:
++    """Persist the set of processed source IDs to a small local JSON file."""
++    os.makedirs(os.path.dirname(path), exist_ok=True)
++    with open(path, "w", encoding="utf-8") as handle:
++        json.dump({"seen": sorted(seen)}, handle, indent=2)
++
++
++def filter_unseen(
++    candidates: list[HackerNewsArticleMetadata],
++    seen_ids: set[str],
++) -> list[HackerNewsArticleMetadata]:
++    """Drop candidates whose source_id was already processed on a prior run."""
++    return [
++        candidate for candidate in candidates if candidate.source_id not in seen_ids
++    ]
++
++
++# --------------------------------------------------------------------------- #
++# Extraction layer: External pages -> List[ArticleContent]
++# --------------------------------------------------------------------------- #
++def fetch_article_content(
++    meta: HackerNewsArticleMetadata,
++) -> ArticleContent | None:
++    """Fetch and extract the main content of a single article, or ``None``.
++
++    Failures (network errors, non-HTML content types, thin pages) are skipped
++    rather than raised so a single bad link never aborts the pipeline.
++    """
++    try:
++        response = requests.get(
++            meta.url, timeout=REQUEST_TIMEOUT, headers={"User-Agent": USER_AGENT}
++        )
++    except requests.RequestException as exc:
++        print(f"    ! Skipping {meta.url}: request failed ({exc})")
++        return None
++
++    if response.status_code != 200:
++        print(f"    ! Skipping {meta.url}: HTTP {response.status_code}")
++        return None
++
++    content_type = response.headers.get("Content-Type", "").lower()
++    if "html" not in content_type:
++        print(f"    ! Skipping {meta.url}: unsupported content type '{content_type}'")
++        return None
++
++    extracted = trafilatura.extract(
++        response.text, include_comments=False, include_tables=False
++    )
++    text = (extracted or "").strip()
++    if len(text) < MIN_CONTENT_CHARS:
++        print(f"    ! Skipping {meta.url}: no usable article text extracted")
++        return None
++
++    return ArticleContent(
++        source_id=meta.source_id,
++        title=meta.title,
++        url=meta.url,
++        text=text,
++    )
++
++
++def extract_articles(
++    candidates: list[HackerNewsArticleMetadata],
++    limit: int = MAX_ARTICLES,
++) -> list[ArticleContent]:
++    """Fetch content for candidates, stopping after ``limit`` usable articles."""
++    collected: list[ArticleContent] = []
++    for meta in candidates:
++        if len(collected) >= limit:
++            break
++        print(f"    - Fetching: {meta.title}")
++        content = fetch_article_content(meta)
++        if content is not None:
++            collected.append(content)
++    return collected
++
++
++# --------------------------------------------------------------------------- #
++# Record validation layer: verify extracted article records
++# --------------------------------------------------------------------------- #
++def validate_articles(
++    articles: list[ArticleContent],
++    known_source_ids: set[str],
++) -> tuple[list[ArticleContent], list[str]]:
++    """Validate extracted records against the set of known HN source IDs.
++
++    Any article whose ``source_id`` is empty or does not appear in
++    ``known_source_ids`` is dropped and reported as a warning, guaranteeing the
++    downstream LLM only ever sees traceable, non-hallucinated source material.
++    """
++    valid: list[ArticleContent] = []
++    warnings: list[str] = []
++
++    for article in articles:
++        if not article.source_id or article.source_id not in known_source_ids:
++            warnings.append(
++                f"Article '{article.title}' has unknown source_id "
++                f"'{article.source_id}'; dropping record."
++            )
++            continue
++        if not article.text.strip():
++            warnings.append(
++                f"Article '{article.title}' (source_id '{article.source_id}') "
++                "has empty content; dropping record."
++            )
++            continue
++        valid.append(article)
++
++    return valid, warnings
++
++
++# --------------------------------------------------------------------------- #
++# LLM analysis layer: List[ArticleContent] -> ResearchBrief
++# --------------------------------------------------------------------------- #
++_SYSTEM_PROMPT = (
++    "You are a meticulous research analyst. You read news/tech articles and "
++    "produce a structured JSON research brief. Strict rules:\n"
++    "1. Use ONLY information present in the provided article texts. Never invent "
++    "facts, numbers, names, or events.\n"
++    "2. Reuse the EXACT source_id and title supplied for each article. Do not "
++    "alter, translate, or paraphrase them.\n"
++    "3. Ground every key point and the sentiment in the text, and supply short "
++    "verbatim evidence quotes copied from the article.\n"
++    "4. If the text does not support a claim, omit the claim.\n"
++    "Respond with valid JSON only - no Markdown, no commentary."
++)
++
++_SCHEMA_EXAMPLE = {
++    "insights": [
++        {
++            "source_id": "<exact source_id>",
++            "title": "<exact title>",
++            "url": "<article url>",
++            "summary": "<2-3 sentence neutral summary grounded in the text>",
++            "key_points": ["<key point>", "<key point>"],
++            "sentiment": "positive | neutral | negative",
++            "evidence": ["<verbatim quote from the article>"],
++        }
++    ],
++    "overall_summary": "<high-level summary across all articles>",
++    "cross_article_synthesis": "<themes/contrasts connecting the articles>",
++}
++
++
++def build_client() -> OpenAI:
++    """Construct an OpenAI client from the ``OPENAI_API_KEY`` environment var."""
++    api_key = os.getenv("OPENAI_API_KEY")
++    if not api_key:
++        raise RuntimeError(
++            "OPENAI_API_KEY is not set. Add it to your .env file before running."
++        )
++    return OpenAI(api_key=api_key)
++
++
++def _call_llm(client: OpenAI, model: str, system: str, user: str) -> str:
++    """Call the chat completions API, degrading gracefully across models."""
++    messages = [
++        {"role": "system", "content": system},
++        {"role": "user", "content": user},
++    ]
++    try:
++        response = client.chat.completions.create(
++            model=model,
++            messages=messages,
++            response_format={"type": "json_object"},
++            temperature=0.2,
++        )
++    except Exception:
++        # Some models reject json_object mode or custom temperatures; retry plain.
++        response = client.chat.completions.create(model=model, messages=messages)
++    return response.choices[0].message.content or ""
++
++
++def analyze_articles(
++    articles: list[ArticleContent],
++    client: OpenAI,
++    model: str,
++) -> ResearchBrief:
++    """Produce a structured :class:`ResearchBrief` from the article set."""
++    payload = [
++        {
++            "source_id": article.source_id,
++            "title": article.title,
++            "url": article.url,
++            "text": article.text[:MAX_CHARS_PER_ARTICLE],
++        }
++        for article in articles
++    ]
++
++    user_prompt = (
++        "Analyse the following articles and return a JSON object with EXACTLY "
++        "this shape:\n"
++        f"{json.dumps(_SCHEMA_EXAMPLE, indent=2)}\n\n"
++        "Produce one entry in `insights` per article, preserving each provided "
++        "source_id and title verbatim.\n\n"
++        f"Articles:\n{json.dumps(payload, ensure_ascii=False)}"
++    )
++
++    raw = _call_llm(client, model, _SYSTEM_PROMPT, user_prompt)
++    data = json.loads(_strip_code_fence(raw))
++    return ResearchBrief.model_validate(data)
++
++
++# --------------------------------------------------------------------------- #
++# Application validation: ResearchBrief + article set -> verified brief
++# --------------------------------------------------------------------------- #
++def verify_brief(
++    brief: ResearchBrief,
++    articles: list[ArticleContent],
++) -> tuple[ResearchBrief, list[str]]:
++    """Cross-check the LLM output against the ground-truth article set.
++
++    Enforces the anti-hallucination contract: insights must reference a known
++    source_id, titles are corrected to match the source exactly, missing URLs
++    are backfilled, and any uncovered article is reported.
++    """
++    warnings: list[str] = []
++    known = {article.source_id: article for article in articles}
++    verified: list[ArticleInsight] = []
++
++    for insight in brief.insights:
++        source = known.get(insight.source_id)
++        if source is None:
++            warnings.append(
++                f"Dropping insight with unknown source_id '{insight.source_id}' "
++                "(not part of the source set - possible hallucination)."
++            )
++            continue
++        if insight.title != source.title:
++            warnings.append(
++                f"Corrected title for source_id '{insight.source_id}' to match "
++                "the source article."
++            )
++            insight.title = source.title
++        if not insight.url:
++            insight.url = source.url
++        verified.append(insight)
++
++    brief.insights = verified
++
++    covered = {insight.source_id for insight in verified}
++    for article in articles:
++        if article.source_id not in covered:
++            warnings.append(
++                f"No insight was produced for source_id '{article.source_id}' "
++                f"({article.title})."
++            )
++
++    return brief, warnings
++
++
++# --------------------------------------------------------------------------- #
++# Presentation layer: verified brief -> terminal report + Markdown artifact
++# --------------------------------------------------------------------------- #
++def render_terminal_report(brief: ResearchBrief, warnings: list[str]) -> None:
++    """Print a human-readable research brief to the terminal."""
++    line = "=" * 72
++    print(f"\n{line}")
++    print("HACKER NEWS RESEARCH BRIEF")
++    print(line)
++
++    for index, insight in enumerate(brief.insights, start=1):
++        print(f"\n[{index}] {insight.title}")
++        print(f"    Source ID : {insight.source_id}")
++        print(f"    URL       : {insight.url}")
++        print(f"    Sentiment : {insight.sentiment}")
++        if insight.summary:
++            print(f"    Summary   : {insight.summary}")
++        if insight.key_points:
++            print("    Key points:")
++            for point in insight.key_points:
++                print(f"      - {point}")
++        if insight.evidence:
++            print("    Evidence:")
++            for quote in insight.evidence:
++                print(f"      > {quote}")
++
++    if brief.overall_summary:
++        print(f"\n{line}")
++        print("OVERALL SUMMARY")
++        print(line)
++        print(brief.overall_summary)
++
++    if brief.cross_article_synthesis:
++        print(f"\n{line}")
++        print("CROSS-ARTICLE SYNTHESIS")
++        print(line)
++        print(brief.cross_article_synthesis)
++
++    if warnings:
++        print(f"\n{line}")
++        print(f"VALIDATION WARNINGS ({len(warnings)})")
++        print(line)
++        for warning in warnings:
++            print(f"  ! {warning}")
++
++    print()
++
++
++def render_markdown(brief: ResearchBrief, warnings: list[str]) -> str:
++    """Render the verified brief as a Markdown document."""
++    timestamp = _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
++    lines: list[str] = [
++        "# Hacker News Research Brief",
++        "",
++        f"_Generated on {timestamp}_",
++        "",
++        "## Per-article insights",
++        "",
++    ]
++
++    for index, insight in enumerate(brief.insights, start=1):
++        lines.append(f"### {index}. {insight.title}")
++        lines.append("")
++        lines.append(f"- **Source ID:** `{insight.source_id}`")
++        lines.append(f"- **URL:** <{insight.url}>")
++        lines.append(f"- **Sentiment:** {insight.sentiment}")
++        lines.append("")
++        if insight.summary:
++            lines.append(insight.summary)
++            lines.append("")
++        if insight.key_points:
++            lines.append("**Key points**")
++            lines.append("")
++            lines.extend(f"- {point}" for point in insight.key_points)
++            lines.append("")
++        if insight.evidence:
++            lines.append("**Evidence**")
++            lines.append("")
++            lines.extend(f"> {quote}" for quote in insight.evidence)
++            lines.append("")
++
++    if brief.overall_summary:
++        lines.extend(["## Overall summary", "", brief.overall_summary, ""])
++
++    if brief.cross_article_synthesis:
++        lines.extend(
++            ["## Cross-article synthesis", "", brief.cross_article_synthesis, ""]
++        )
++
++    if warnings:
++        lines.extend([f"## Validation warnings ({len(warnings)})", ""])
++        lines.extend(f"- {warning}" for warning in warnings)
++        lines.append("")
++
++    return "\n".join(lines)
++
++
++def save_markdown(markdown: str) -> str:
++    """Write the Markdown brief to a timestamped file in ``output/``."""
++    os.makedirs(OUTPUT_DIR, exist_ok=True)
++    timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
++    path = os.path.join(OUTPUT_DIR, f"research_brief_{timestamp}.md")
++    with open(path, "w", encoding="utf-8") as handle:
++        handle.write(markdown)
++    return path
++
++
++# --------------------------------------------------------------------------- #
++# Orchestration
++# --------------------------------------------------------------------------- #
++def main() -> int:
++    """Run the full Research Brief pipeline end to end."""
++    load_dotenv()
++    model = os.getenv("OPENAI_MODEL") or DEFAULT_MODEL
++
++    try:
++        print("[1/6] Fetching Hacker News front page...")
++        html = fetch_frontpage()
++        metadata = parse_frontpage(html)
++        print(f"      Parsed {len(metadata)} stories.")
++
++        print("[2/6] Filtering external candidates...")
++        candidates = filter_external(metadata)
++        seen_ids = load_seen_ids()
++        fresh_candidates = filter_unseen(candidates, seen_ids)
++        print(
++            f"      {len(candidates)} external candidates "
++            f"({len(candidates) - len(fresh_candidates)} already seen, "
++            f"{len(fresh_candidates)} new)."
++        )
++
++        print(f"[3/6] Extracting article content (up to {MAX_ARTICLES})...")
++        articles = extract_articles(fresh_candidates, MAX_ARTICLES)
++        print(f"      Extracted {len(articles)} usable articles.")
++
++        print("[4/6] Validating article records...")
++        known_ids = {meta.source_id for meta in metadata}
++        articles, record_warnings = validate_articles(articles, known_ids)
++        if not articles:
++            print("      No new usable articles remain. Aborting.")
++            return 1
++
++        print(f"[5/6] Analysing articles with model '{model}'...")
++        client = build_client()
++        try:
++            brief = analyze_articles(articles, client, model)
++        except Exception as exc:  # noqa: BLE001 - resilient model fallback
++            if model != DEFAULT_MODEL:
++                print(
++                    f"      ! Model '{model}' failed ({exc}); "
++                    f"retrying with '{DEFAULT_MODEL}'."
++                )
++                brief = analyze_articles(articles, client, DEFAULT_MODEL)
++            else:
++                raise
++        brief, app_warnings = verify_brief(brief, articles)
++
++        print("[6/6] Rendering report...")
++        warnings = record_warnings + app_warnings
++        render_terminal_report(brief, warnings)
++
++        markdown = render_markdown(brief, warnings)
++        path = save_markdown(markdown)
++        print(f"Markdown artifact saved to: {path}")
++
++        # Remember the freshly processed articles so future runs skip them.
++        seen_ids |= {article.source_id for article in articles}
++        try:
++            save_seen_ids(seen_ids)
++            print(f"Deduplication state updated ({len(seen_ids)} remembered).")
++        except OSError as exc:
++            print(f"      ! Could not persist deduplication state: {exc}")
++
++        return 0
++
++    except (requests.RequestException, RuntimeError, ValidationError) as exc:
++        print(f"\nERROR: {exc}", file=sys.stderr)
++        return 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/output/research_brief_20260714_111011.md b/output/research_brief_20260714_111011.md
+new file mode 100644
+index 0000000..4a74a46
+--- /dev/null
++++ b/output/research_brief_20260714_111011.md
+@@ -0,0 +1,85 @@
++# Hacker News Research Brief
++
++_Generated on 2026-07-14 11:10:11_
++
++## Per-article insights
++
++### 1. Measuring Input Latency on Linux: X11 vs. Wayland, VRR, and DXVK
++
++- **Source ID:** `48909424`
++- **URL:** <https://marco-nett.de/blog/measuring-input-latency-on-linux-x11-vs-wayland-vrr-dxvk/>
++- **Sentiment:** neutral
++
++The article describes a custom hardware-based method to measure end-to-end input latency on Linux gaming setups and applies it to compare X11, Wayland, VRR, and dxvk-low-latency. In the reported tests, X11 is slightly faster than Wayland, VRR shows the largest consistent latency improvement, and dxvk-low-latency appears to help modestly in capped cases while offering more value in uncapped scenarios.
++
++**Key points**
++
++- The author built a device to measure end-to-end latency by timing the interval between a simulated click and a detected screen brightness change.
++- X11 was faster than Wayland in every tested scenario, but only by 0.14 to 0.22 ms.
++- VRR had the biggest measured impact, improving latency by 0.26 to 0.45 ms and narrowing the latency distribution.
++- In capped test cases, dxvk-low-latency was about as beneficial as the X11 versus Wayland difference, and the author says its main strength appears in uncapped cases.
++
++**Evidence**
++
++> The idea is simple: Strap a device with some kind of light sensor onto a monitor and connect it via USB to the PC to simulate mouse clicks.
++> This way, you measure the end-to-end system latency.
++> X11 wins in each scenario, but it is just a 0.14 to 0.22 ms difference.
++> VRR has the biggest impact across the pairings: enabling it is 0.26 to 0.45 ms faster than leaving it disabled.
++> In the capped test cases, the difference is small but consistent and of about the same magnitude as X11 vs Wayland.
++> In the uncapped test cases, we can get an idea of where the real strength of dxvk-low-latency lies: smoothing out uneven frame pacing and preventing render-queue buildup.
++
++### 2. The Tower Keeps Rising
++
++- **Source ID:** `48909785`
++- **URL:** <https://lucumr.pocoo.org/2026/7/13/the-tower-keeps-rising/>
++- **Sentiment:** negative
++
++The article argues that AI-assisted programming increases individual developers' ability to change code, but may weaken the shared understanding that large software projects depend on. Using the Tower of Babel as a metaphor, it suggests that software construction can continue even after human coordination has degraded, making the loss harder to notice.
++
++**Key points**
++
++- The author says large software projects are constrained not just by coding speed but by how well people coordinate their understanding of the system.
++- Shared understanding in software projects is described as a common language of concepts, boundaries, invariants, ownership, and rationale.
++- The article argues that pre-agent friction sometimes helped synchronize understanding across teams.
++- The author warns that AI agents can let changes keep landing even as the architectural language among humans disappears.
++
++**Evidence**
++
++> But large software projects have never been limited only by how quickly an individual can produce code. They are limited by how well people can coordinate their understanding of the system they are changing.
++> The shared language of a software project is not English or Python but it is the common understanding of what its concepts mean, where the boundaries are, which invariants matter, who owns what, and why the system has the shape it does.
++> This friction synchronizes people.
++> The changes keep landing, even as the architectural language that would let the humans reason about them together disappears.
++> The tower does not fall, and so we do not notice what was lost. It just keeps rising.
++
++### 3. Your 'app' could have been a webpage (so I fixed it for you)
++
++- **Source ID:** `48869989`
++- **URL:** <https://danq.me/2026/07/09/your-app-could-have-been-a-webpage/>
++- **Sentiment:** negative
++
++The article criticizes a travel app as unnecessary for delivering itinerary information that could have been provided as a webpage. After intercepting the app's traffic and extracting JSON data, the author built a password-protected HTML alternative that omits tracking and advertisements while offering broader usability.
++
++**Key points**
++
++- The author argues the app mainly adds tracking and advertisements rather than capabilities a webpage could not provide.
++- By intercepting the app's traffic, the author found it fetched itinerary data as JSON from a URL built from the username and password.
++- The author created a Ruby script to periodically fetch the JSON and generate an HTML page.
++- The replacement webpage is presented as smaller, more accessible, and more feature-rich than the original app.
++
++**Evidence**
++
++> This should have been a webpage.
++> There only seem to be two things that this “app” does, that a webpage might not have, and they’re both anti-features:
++> It reports tracking data associated with your Google Account back to the developers.
++> It shows you advertisements (which they call “inspirations”) for other trips organised by the same agency.
++> With only a couple of minutes experimentation I discovered that the app works by concatenating the username and password
++> I wrote a Ruby script that runs on a Cron schedule to pull the latest JSON and use it to build a HTML page.
++> Either a 43MB app (ballooning to 124MB when it’s finished downloading extra content) with tracking and advertisements… or a 0.05MB web page (with an optional extra 35MB of images) that provides more features and works on more devices.
++
++## Overall summary
++
++Across the three articles, the authors examine technology through direct measurement, system-level coordination, and practical usability. One article reports measured Linux gaming latency differences, another warns that AI-assisted coding can erode shared understanding in software teams, and the third argues that a mobile app unnecessarily replaced a simpler and more accessible web page.
++
++## Cross-article synthesis
++
++A common theme is skepticism toward assumptions and hype: the latency article tests debated Linux gaming claims with measurements, the AI essay questions whether faster code generation improves large-scale software development, and the app critique challenges the idea that an app is the right medium for simple content delivery. The first article is empirical and comparative, the second is conceptual and cautionary about coordination, and the third is a hands-on critique of product design that emphasizes openness, accessibility, and reduced overhead.
+diff --git a/output/research_brief_20260714_111259.md b/output/research_brief_20260714_111259.md
+new file mode 100644
+index 0000000..5c653bf
+--- /dev/null
++++ b/output/research_brief_20260714_111259.md
+@@ -0,0 +1,82 @@
++# Hacker News Research Brief
++
++_Generated on 2026-07-14 11:12:59_
++
++## Per-article insights
++
++### 1. Measuring Input Latency on Linux: X11 vs. Wayland, VRR, and DXVK
++
++- **Source ID:** `48909424`
++- **URL:** <https://marco-nett.de/blog/measuring-input-latency-on-linux-x11-vs-wayland-vrr-dxvk/>
++- **Sentiment:** neutral
++
++The article describes a custom hardware-based method to measure end-to-end input latency on Linux gaming setups and applies it to compare X11, Wayland, VRR, and dxvk-low-latency. The reported results suggest only a very small latency advantage for X11 over Wayland, while VRR and dxvk-low-latency show measurable benefits in the tested scenarios.
++
++**Key points**
++
++- The author built a device to measure end-to-end system latency by timing the interval between a simulated click and a detected screen brightness change.
++- In the tested scenarios, X11 was faster than Wayland by only 0.14 to 0.22 ms, which the author says is too small to explain broader perceptions that Wayland feels much worse.
++- VRR had the largest measured impact, improving latency by 0.26 to 0.45 ms and narrowing the latency distribution spread.
++- dxvk-low-latency showed a small but consistent benefit in capped cases and was presented as especially useful for smoothing uneven frame pacing and preventing render-queue buildup in uncapped cases.
++
++**Evidence**
++
++> This way, you measure the end-to-end system latency.
++> Yes, but nowhere near enough to explain why Wayland is generally perceived as much worse than X11.
++> X11 wins in each scenario, but it is just a 0.14 to 0.22 ms difference.
++> VRR has the biggest impact across the pairings: enabling it is 0.26 to 0.45 ms faster than leaving it disabled.
++> Where the difference between Wayland and X11 is on average 0.18 ms, using dxvk-low-latency is on average 0.20 ms faster.
++
++### 2. The Tower Keeps Rising
++
++- **Source ID:** `48909785`
++- **URL:** <https://lucumr.pocoo.org/2026/7/13/the-tower-keeps-rising/>
++- **Sentiment:** negative
++
++The article uses the Tower of Babel as a metaphor for AI-assisted software development, arguing that large projects depend on shared understanding more than on individual coding speed. It contends that agents can reduce the friction that once helped synchronize teams, allowing code changes to continue even as common architectural understanding erodes.
++
++**Key points**
++
++- The author argues that the main constraint in large software projects is coordination and shared understanding, not just how quickly individuals can write code.
++- The article says that pre-agent development friction sometimes helped teams synchronize their understanding of systems.
++- It claims that agents can let developers make isolated changes without acquiring the shared model that earlier collaboration would have required.
++- The central contrast with Babel is that AI-assisted engineering can keep progressing even after shared understanding has collapsed.
++
++**Evidence**
++
++> They are limited by how well people can coordinate their understanding of the system they are changing.
++> This friction synchronizes people.
++> None of us necessarily has to talk to the others, or even acquire the part of the shared model that the change once would have forced us to learn.
++> The changes keep landing, even as the architectural language that would let the humans reason about them together disappears.
++> The tower does not fall, and so we do not notice what was lost. It just keeps rising.
++
++### 3. Your 'app' could have been a webpage (so I fixed it for you)
++
++- **Source ID:** `48869989`
++- **URL:** <https://danq.me/2026/07/09/your-app-could-have-been-a-webpage/>
++- **Sentiment:** negative
++
++The article criticizes a travel app as unnecessary for delivering itinerary information that could have been provided as a webpage. After intercepting the app's traffic and extracting its JSON-backed content, the author built a password-protected HTML alternative that removes ads and tracking while offering broader usability.
++
++**Key points**
++
++- The author argues the app mainly adds tracking and advertisements rather than capabilities that require a native app.
++- By intercepting the app's traffic, the author found it fetched itinerary data as JSON from a URL built from the username and password.
++- The author created a Ruby script to periodically fetch the JSON and generate a hosted HTML page from it.
++- The replacement webpage is described as smaller, more featureful, and more widely accessible than the original app.
++
++**Evidence**
++
++> This should have been a webpage.
++> There only seem to be two things that this “app” does, that a webpage might not have, and they’re both anti-features:
++> This returns a pile of JSON which, with a little interpretation, can be seen to represent all of the content the app “shows”.
++> I wrote a Ruby script that runs on a Cron schedule to pull the latest JSON and use it to build a HTML page.
++> Travelbound is not one of them.
++
++## Overall summary
++
++Across the three articles, the authors examine software and systems through measurement, coordination, and delivery choices. One presents empirical latency testing on Linux gaming, another warns that AI agents can weaken shared understanding in software teams, and the third argues that a content-delivery app was unnecessarily built as an app instead of a webpage.
++
++## Cross-article synthesis
++
++A common theme is skepticism toward assumptions and defaults in software. The Linux latency article tests widely repeated claims with direct measurement; the AI engineering article questions whether faster code generation improves large-scale software when coordination degrades; and the webpage-vs-app article challenges app-first product decisions by showing the underlying content was already web-deliverable. Together, they contrast optimization grounded in evidence with complexity that may obscure tradeoffs or reduce usability.
+diff --git a/output/research_brief_20260714_111943.md b/output/research_brief_20260714_111943.md
+new file mode 100644
+index 0000000..14aae6d
+--- /dev/null
++++ b/output/research_brief_20260714_111943.md
+@@ -0,0 +1,81 @@
++# Hacker News Research Brief
++
++_Generated on 2026-07-14 11:19:43_
++
++## Per-article insights
++
++### 1. Measuring Input Latency on Linux: X11 vs. Wayland, VRR, and DXVK
++
++- **Source ID:** `48909424`
++- **URL:** <https://marco-nett.de/blog/measuring-input-latency-on-linux-x11-vs-wayland-vrr-dxvk/>
++- **Sentiment:** neutral
++
++The article describes a custom hardware-based method for measuring end-to-end input latency on Linux gaming setups and applies it to compare X11, Wayland, VRR, and dxvk-low-latency. Based on the reported tests, X11 is slightly faster than Wayland, VRR has the largest consistent latency benefit, and dxvk-low-latency shows modest gains in capped cases while being intended to help more in uneven or uncapped scenarios.
++
++**Key points**
++
++- The author built a light-sensor-based USB device to measure end-to-end system latency from click to screen change.
++- X11 was faster than Wayland in every tested scenario, but only by 0.14 to 0.22 ms.
++- Enabling VRR produced the biggest consistent improvement, reducing latency by 0.26 to 0.45 ms and narrowing the latency spread.
++- In capped test cases, dxvk-low-latency was about 0.20 ms faster on average and is described as especially useful for smoothing uneven frame pacing and preventing render-queue buildup.
++
++**Evidence**
++
++> This way, you measure the end-to-end system latency.
++> X11 wins in each scenario, but it is just a 0.14 to 0.22 ms difference.
++> VRR has the biggest impact across the pairings: enabling it is 0.26 to 0.45 ms faster than leaving it disabled.
++> Where the difference between Wayland and X11 is on average 0.18 ms, using dxvk-low-latency is on average 0.20 ms faster.
++
++### 2. The Tower Keeps Rising
++
++- **Source ID:** `48909785`
++- **URL:** <https://lucumr.pocoo.org/2026/7/13/the-tower-keeps-rising/>
++- **Sentiment:** negative
++
++The article argues that AI-assisted programming increases individual developers' ability to change codebases, but may weaken the shared understanding that large software projects depend on. Using the Tower of Babel as a metaphor, it suggests that software construction can continue even after human coordination and common architectural language have eroded.
++
++**Key points**
++
++- The author says large software projects are constrained not just by coding speed but by how well people coordinate their understanding of the system.
++- Shared understanding in software projects is maintained partly through documentation, review, conversation, and the friction of collaboration.
++- Agents reduce that friction, allowing isolated changes to land without requiring developers to build shared context.
++- The article's central contrast is that unlike Babel, AI-assisted engineering can keep building even after shared understanding has collapsed.
++
++**Evidence**
++
++> They are limited by how well people can coordinate their understanding of the system they are changing.
++> This friction synchronizes people.
++> Agents remove much of that friction.
++> construction can continue after shared understanding has already collapsed.
++> The tower does not fall, and so we do not notice what was lost. It just keeps rising.
++
++### 3. Your 'app' could have been a webpage (so I fixed it for you)
++
++- **Source ID:** `48869989`
++- **URL:** <https://danq.me/2026/07/09/your-app-could-have-been-a-webpage/>
++- **Sentiment:** negative
++
++The article criticizes a travel app as unnecessary for delivering itinerary information that could have been provided as a webpage. After intercepting the app's traffic and extracting its JSON-backed content, the author built a password-protected HTML alternative that omits ads and tracking while offering broader usability.
++
++**Key points**
++
++- The author argues the app delivers content that should have been a webpage rather than requiring installation.
++- The app is described as adding tracking and advertisements rather than unique user benefits.
++- By intercepting the app's network traffic, the author found it fetched itinerary data as JSON from a URL built from the username and password.
++- The replacement webpage was generated from the JSON, excluded the app's 'inspirations' ads, and was presented as smaller and more broadly accessible.
++
++**Evidence**
++
++> This should have been a webpage.
++> It reports tracking data associated with your Google Account back to the developers.
++> It shows you advertisements (which they call “inspirations”) for other trips organised by the same agency.
++> This returns a pile of JSON which, with a little interpretation, can be seen to represent all of the content the app “shows”.
++> There are (some) tasks for which an “app” is absolutely the right choice of medium. Travelbound is not one of them.
++
++## Overall summary
++
++Across the articles, the authors examine technology through practical measurement or critique: one measures Linux gaming latency across display and rendering configurations, one reflects on how AI agents may undermine shared understanding in software teams, and one argues that a content-delivery mobile app should have been a simpler webpage. Together they emphasize the gap between technical claims or convenience and the underlying realities of performance, coordination, and user experience.
++
++## Cross-article synthesis
++
++A common theme is skepticism toward accepted or marketed technical approaches and a preference for verifying what actually matters. The Linux latency article tests debated claims with measurements, the AI essay questions whether faster code generation preserves the human coordination needed for large systems, and the webpage article challenges app-first design by showing a simpler web alternative. The first article is empirical and comparatively balanced, while the latter two are more critical, focusing on hidden costs: loss of shared understanding in one case and unnecessary tracking, ads, and complexity in the other.
+diff --git a/output/research_brief_20260714_112037.md b/output/research_brief_20260714_112037.md
+new file mode 100644
+index 0000000..ba9e715
+--- /dev/null
++++ b/output/research_brief_20260714_112037.md
+@@ -0,0 +1,83 @@
++# Hacker News Research Brief
++
++_Generated on 2026-07-14 11:20:37_
++
++## Per-article insights
++
++### 1. S&P downgrades Oracle to BBB – only one notch above junk level
++
++- **Source ID:** `48909768`
++- **URL:** <https://www.heise.de/en/news/S-P-downgrades-Oracle-to-BBB-only-one-notch-above-junk-level-11363472.html>
++- **Sentiment:** negative
++
++S&P Global downgraded Oracle's credit rating from BBB to BBB- because of heavy AI infrastructure spending that is increasing debt and capital needs. The article says Oracle faces large projected cash flow deficits, customer concentration risk tied to OpenAI, and a broader transition from software toward cloud infrastructure.
++
++**Key points**
++
++- S&P lowered Oracle's credit rating from BBB to BBB-, leaving it one notch above speculative territory while keeping the outlook stable.
++- S&P links the downgrade to Oracle's rapidly expanding AI infrastructure business, including projected free operating cash flow deficits and much higher spending on AI data centers.
++- The article highlights Oracle's dependence on OpenAI as a major customer and describes OpenAI as a central credit risk.
++- Oracle is shifting toward cloud infrastructure, but S&P says it is in a weaker position than other hyperscalers and has cut over 21,000 jobs during the AI expansion.
++
++**Evidence**
++
++> S&P Global has downgraded Oracle's rating due to massive AI investments.
++> Rating agency S&P Global has lowered Oracle's creditworthiness from BBB to BBB- – this is the lowest notch in the so-called investment-grade area.
++> S&P forecasts a deficit in free operating cash flow of almost 42 billion US dollars for the 2027 fiscal year.
++> S&P therefore explicitly describes OpenAI as a “central credit risk”.
++> In parallel with the AI expansion, Oracle has cut over 21,000 jobs in the past twelve months – about 13 percent of the workforce.
++
++### 2. How to stop Claude from saying load-bearing
++
++- **Source ID:** `48905248`
++- **URL:** <https://jola.dev/posts/how-to-stop-claude-from-saying-load-bearing>
++- **Sentiment:** positive
++
++The post explains how to use a MessageDisplay hook in Claude to replace selected words and phrases in displayed output. It provides a Python script, installation path, settings configuration, and notes that hooks load at startup so a new session is needed.
++
++**Key points**
++
++- The article presents a MessageDisplay hook as a way to change Claude's displayed vocabulary.
++- It includes a Python script that replaces phrases such as "load-bearing" and "honest take" with user-defined alternatives.
++- The setup requires placing the script in ~/.claude/hooks, making it executable, and adding it to ~/.claude/settings.json.
++- The author frames the approach as both a fix for frustrating wording and a playful customization.
++
++**Evidence**
++
++> I present to you, the MessageDisplay hook.
++> First you need a little script with some replacements set up:
++> put that in ~/.claude/hooks/wordswap.sh and make it executable with chmod +x ~/.claude/hooks/wordswap.sh.
++> Hooks load at startup, so you just need to start a new session to start your new life.
++> Have fun!
++
++### 3. The zero-cost fallacy: open-source software in the agentic era
++
++- **Source ID:** `48865001`
++- **URL:** <https://www.thoughtworks.com/insights/blog/open-source/zero-cost-fallacy-open-source-agentic-era>
++- **Sentiment:** negative
++
++The article argues that open source is under severe strain from unsustainable economics, maintainer burnout, and the effects of AI-driven code generation. It says permissive licensing has enabled extraction by large corporations while automated low-quality pull requests and degraded trust are making maintenance and governance harder.
++
++**Key points**
++
++- The article challenges the idea that open source is a costless public good, emphasizing that maintenance carries significant human labor and burnout.
++- It says maintainers of critical packages face exploitation and harassment while corporations capture value without adequately supporting the ecosystem.
++- AI-generated pull requests are described as flooding repositories with low-quality contributions, increasing unpaid review burdens.
++- The piece argues that trust in open-source projects has weakened and that both permissive and restrictive licensing models create serious problems.
++
++**Evidence**
++
++> The reality we must face is stark: open source isn’t simply undergoing an evolution; it is being ground down by structural exhaustion, supply chain warfare and the industrialization of code generation.
++> While distribution costs nothing, maintenance is incredibly expensive.
++> Maintainers of load-bearing open-source packages ... are burning out and facing psychological harassment from multi billion dollar entities that consume their labor without contributing a single cent back.
++> Maintainers are now facing an assault on two fronts.
++> The barrier to entry for generating code has dropped to zero.
++> Taken together, we have a situation where open source’s trust model has been severely degraded.
++
++## Overall summary
++
++Across the articles, the texts describe pressure points created by AI and software infrastructure changes: Oracle's finances are strained by debt-heavy AI expansion, one post offers a practical way to customize Claude's wording, and another argues that open source is being destabilized by unsustainable economics and AI-generated code workflows.
++
++## Cross-article synthesis
++
++A common theme is how AI is reshaping software ecosystems and operational burdens. The Oracle article focuses on financial and credit risk from large-scale AI infrastructure investment, while the open-source article emphasizes labor, trust, and licensing strain caused by AI-era code generation; in contrast, the Claude hook post presents a small, user-level customization that treats AI behavior as something configurable and manageable rather than systemic risk.
+diff --git a/output/research_brief_20260714_112115.md b/output/research_brief_20260714_112115.md
+new file mode 100644
+index 0000000..4988bf5
+--- /dev/null
++++ b/output/research_brief_20260714_112115.md
+@@ -0,0 +1,87 @@
++# Hacker News Research Brief
++
++_Generated on 2026-07-14 11:21:15_
++
++## Per-article insights
++
++### 1. Launch HN: Agnost AI (YC S26) – Extract user feedback from agent conversations
++
++- **Source ID:** `48908950`
++- **URL:** <https://agnost.ai>
++- **Sentiment:** positive
++
++The article presents Agnost AI as a Y Combinator-backed product focused on analyzing real production agent conversations to identify failures, extract signals, and suggest improvements. It emphasizes compatibility with any LLM or framework, a quick setup, and tiered plans for teams ranging from starter usage to large-scale organizations.
++
++**Key points**
++
++- Agnost AI is positioned as a tool that finds failures in real conversations that evaluations may miss.
++- The product highlights features including intent and sentiment extraction, automatic agent improvements, failure detection and resolution, and natural language data queries.
++- The article says the service works with any LLM and framework, has a 2-minute setup, and is OpenTelemetry native.
++- Pricing tiers are described for starter, growth, and enterprise-style usage with different message limits, retention periods, and support options.
++
++**Evidence**
++
++> Your evals pass. Production still fails.
++> Agnost finds the missed failures in real conversations and turns them into fixes your team can review.
++> Works with any LLM, any framework. 2-min setup. OpenTelemetry native.
++> See the failures your evals missed.
++> - Intent & sentiment signal extraction
++> - Automatic agent improvements
++> - Failure detection & resolution
++> - Natural language data queries
++
++### 2. Kontigo (YC S24) Is Hiring (Head of Security)
++
++- **Source ID:** `48909820`
++- **URL:** <https://www.ycombinator.com/companies/kontigo/jobs/uNttrlv-head-of-security>
++- **Sentiment:** neutral
++
++The article is a brief hiring post for a senior security leadership role at Kontigo. It describes the company as a "USDC-Smart Neobank for Latinos" and says it is building a stable currency platform with global access, while framing the role as demanding and founder-oriented.
++
++**Key points**
++
++- Kontigo is hiring for a senior security role described as Principal Security Engineer, Security Engineering Lead, or CISO.
++- The company describes itself as a "USDC-Smart Neobank for Latinos."
++- The post says the company is building a stable currency platform with global access.
++- The role is framed as difficult and requiring a founder mindset.
++
++**Evidence**
++
++> Principal Security Engineer/ Security Engineering Lead/ CISO
++> USDC-Smart Neobank for Latinos.
++> Building a stable currency platform with global access.
++> You gotta be in founder mode.
++> "Men wanted for hazardous journey. Low wages, bitter cold, long hours of complete darkness. Safe return doubtful. Honour and recognition in event of success"
++
++### 3. A tiny cell that broke a big rule of biology
++
++- **Source ID:** `48847943`
++- **URL:** <https://grist.org/science/nitrogen-cycle-cell-discovery-nitroplast-science-fertilizer-algae-bacteria/>
++- **Sentiment:** neutral
++
++The article recounts Jon Zehr’s long search for a mysterious nitrogen-fixing organism detected through DNA but not visible under a microscope. It explains the broader importance of nitrogen fixation to life, agriculture, and environmental problems, and describes how the organism’s unusual genetics led researchers to suspect it was living inside algae.
++
++**Key points**
++
++- Jon Zehr repeatedly found DNA evidence of a previously unknown nitrogen-fixing bacterium but could not directly observe the organism.
++- Nitrogen fixation is presented as a fundamental biological bottleneck because most life cannot directly use atmospheric nitrogen.
++- Synthetic fertilizer increased crop yields but also caused major environmental harms such as pollution and ocean dead zones.
++- The mystery organism appeared to have lost much of its genome, leading researchers to suspect it survived inside a specific type of algae.
++
++**Evidence**
++
++> For decades, Jon Zehr was haunted by an organism he knew was there — but couldn’t see.
++> Almost immediately, he found traces of a species of nitrogen-fixing bacteria previously unknown to science.
++> Again and again, the genetic signature surfaced but not the visible bacteria.
++> The only organisms that can actually pull this off are ones that can get by without oxygen: super simple bacteria and archaea.
++> Producing synthetic fertilizer uses a massive amount of energy, and the overuse of fertilizer has polluted the water enough to lead to massive “dead zones” in the ocean.
++> it seemed to have lost about 80 percent of its entire genome
++> What if the reason that he had never seen the bacteria under the microscope was because it was hiding in plain sight, inside another organism?
++
++## Overall summary
++
++Across the articles, one piece promotes an AI product for improving agent performance from conversation data, another is a concise hiring post for a security leader at a fintech company, and the third is a science feature about a long-running search for a mysterious nitrogen-fixing organism and its implications for biology and agriculture.
++
++## Cross-article synthesis
++
++A common theme is problem-solving around hard-to-see or hard-to-manage systems: Agnost AI focuses on uncovering hidden failures in production conversations, Kontigo seeks security leadership for a challenging fintech mission, and the science article follows researchers tracking an organism that was detectable genetically but not directly visible. The first two are startup-oriented and operational, while the third is a research narrative connecting microscopic biology to global food systems and environmental consequences.
+diff --git a/output/research_brief_20260714_112132.md b/output/research_brief_20260714_112132.md
+new file mode 100644
+index 0000000..1f8db6a
+--- /dev/null
++++ b/output/research_brief_20260714_112132.md
+@@ -0,0 +1,76 @@
++# Hacker News Research Brief
++
++_Generated on 2026-07-14 11:21:32_
++
++## Per-article insights
++
++### 1. Are we offloading too much of our thinking to AI?
++
++- **Source ID:** `48908178`
++- **URL:** <https://www.artfish.ai/p/offloading-thinking-to-ai>
++- **Sentiment:** negative
++
++The article reflects on a growing tendency to rely on AI for decisions, research, and reasoning, and questions the tradeoff between convenience and personal autonomy. Using examples from fiction, observed behavior, and personal experience, it argues that some forms of thinking are valuable precisely because they require slower, human reflection.
++
++**Key points**
++
++- The author argues that AI is increasingly being used to handle both trivial decisions and complex reasoning.
++- The article contrasts earlier search-engine use, which still required evaluation and synthesis, with AI systems that now produce finished responses directly.
++- The author suggests that relying too heavily on AI can erode autonomy and reduce the value of slow, reflective thinking.
++
++**Evidence**
++
++> I have been observing, in myself and in those around me, a tendency to increasingly offload our thinking to AI.
++> AI increasingly performs those intermediate steps for us, producing a finished response to even complex or esoteric questions in minutes.
++> But it is a fine line between having an assistant that helps with your tasks, and losing all of your autonomy.
++> Maybe there is some value in our lives to forgetting the trivial, to not having an immediate answer to every query that appears in our minds.
++
++### 2. Bonsai 27B (1-bit LLM): The First 27B-Class Model to Run on a Phone
++
++- **Source ID:** `48910545`
++- **URL:** <https://prismml.com/news/bonsai-27b>
++- **Sentiment:** positive
++
++The article announces Bonsai 27B, a multimodal model offered in ternary and 1-bit variants, and presents it as the first 27B-class model that can run on a phone. It emphasizes reduced memory footprint, retained benchmark performance, and the implications for local and hybrid agentic AI workloads.
++
++**Key points**
++
++- The company says the 1-bit 3.9 GB variant fits within a phone memory budget, while the 5.9 GB ternary variant targets laptop-class use.
++- The article claims the model retains most of the full-precision baseline across a 15-benchmark suite while enabling reasoning, tool calling, vision, and long-context use.
++- It argues that local execution can reduce cost and improve privacy for agentic workloads compared with cloud-only deployment.
++
++**Evidence**
++
++> Today, we're announcing Bonsai 27B, based on Qwen3.6 27B, the new multimodal flagship of the Bonsai family and the first model of its capability class to run on a phone.
++> At 3.9 GB, it is the footprint-oriented variant, which fits within the memory budget of an iPhone 17 Pro, bringing a 27B-class model onto a phone for the first time.
++> Across a 15-benchmark suite spanning knowledge, reasoning, math, coding, instruction following, tool calling, and vision (evaluated in thinking mode, where the model's full reasoning is exercised) Ternary Bonsai 27B retains 95% of the full-precision baseline, and 1-bit Bonsai 27B retains 90%.
++> When a model capable of sustained agentic work fits on the device, the agent can live inside the product: the marginal cost of a hundred-step loop is zero, and the user's data never leaves the machine.
++
++### 3. Punch yourself in the face with reality
++
++- **Source ID:** `48905118`
++- **URL:** <https://adi.bio/reality>
++- **Sentiment:** negative
++
++The article argues that AI can either accelerate meaningful progress or become a tool for avoidance and self-delusion. It contends that startup success still depends on difficult real-world actions like talking to users, taking risks, and confronting rejection, rather than simply building faster with AI.
++
++**Key points**
++
++- The author contrasts using AI to rapidly build many things with using it to get to the real problem faster.
++- The article criticizes founders who keep building with AI without validating ideas through conversations with real users.
++- It argues that AI does not remove the hardest parts of building a startup, such as risk, rejection, and persistence.
++
++**Evidence**
++
++> most of it will be abandoned and not get used by anyone in the long term.
++> I have seen way too many startup founders delude themselves into building more and more for months without a single conversation with a real user.
++> If all you know is how to build, and you just use AI as an excuse to keep building more and more and more, you are just procrastinating and avoiding reality.
++> Did AI make any of these easier? I don’t think so.
++
++## Overall summary
++
++Across the articles, AI is presented as both a powerful accelerator and a source of risk. One article highlights a technical advance that makes capable local models practical on phones, while the other two warn that convenience and speed can encourage overreliance, avoidance of real-world validation, and loss of autonomy.
++
++## Cross-article synthesis
++
++A common theme is that AI changes how work gets done, but not necessarily what matters most. The Bonsai 27B article emphasizes capability, efficiency, privacy, and on-device agentic workflows, presenting AI as an enabling infrastructure shift. In contrast, the other two articles focus on human judgment: one worries that AI can replace thinking itself, and the other argues that AI can become a way to avoid hard truths like user feedback, risk, and rejection. Together, they suggest a contrast between AI's expanding technical potential and the continuing importance of human autonomy, critical thinking, and contact with reality.
+diff --git a/output/seen_articles.json b/output/seen_articles.json
+new file mode 100644
+index 0000000..3151725
+--- /dev/null
++++ b/output/seen_articles.json
+@@ -0,0 +1,16 @@
++{
++  "seen": [
++    "48847943",
++    "48865001",
++    "48869989",
++    "48905118",
++    "48905248",
++    "48908178",
++    "48908950",
++    "48909424",
++    "48909768",
++    "48909785",
++    "48909820",
++    "48910545"
++  ]
++}
+\ No newline at end of file
+diff --git a/requirements.txt b/requirements.txt
+index e69de29..0db2615 100644
+--- a/requirements.txt
++++ b/requirements.txt
+@@ -0,0 +1,7 @@
++requests>=2.31
++beautifulsoup4>=4.12
++trafilatura>=1.8
++pydantic>=2.6
++python-dotenv>=1.0
++openai>=1.30
++pytest>=8.0
+diff --git a/tests_main.py b/tests_main.py
+index e69de29..44e1b72 100644
+--- a/tests_main.py
++++ b/tests_main.py
+@@ -0,0 +1,137 @@
++"""Tests for the Hacker News Research Brief pipeline.
++
++Three focused tests covering the most failure-prone layers:
++
++1. Discovery/parsing of the front-page HTML (rank, title, absolute URL,
++   comment count) using an inline HTML fixture.
++2. Record validation correctly flagging an article whose source_id is unknown.
++3. Deduplication skipping candidates seen on previous runs and persisting the
++   set of processed source IDs to a local JSON file.
++"""
++
++from main import (
++    ArticleContent,
++    filter_external,
++    filter_unseen,
++    load_seen_ids,
++    parse_frontpage,
++    save_seen_ids,
++    validate_articles,
++)
++
++# Inline fixture mirroring the real Hacker News front-page markup. It contains
++# one external story and one internal "Ask HN" story (an item?id link).
++HN_FIXTURE = """
++<html><body><table class="itemlist">
++  <tr class='athing' id='40123456'>
++    <td align="right" valign="top" class="title"><span class="rank">1.</span></td>
++    <td valign="top" class="votelinks">
++      <center><a id='up_40123456' href='vote?id=40123456&how=up'>
++        <div class='votearrow' title='upvote'></div></a></center>
++    </td>
++    <td class="title"><span class="titleline">
++      <a href="https://example.com/great-article">A Great Article</a>
++      <span class="sitebit comhead"> (<a href="from?site=example.com">
++        <span class="sitestr">example.com</span></a>)</span>
++    </span></td>
++  </tr>
++  <tr><td colspan="2"></td><td class="subtext"><span class="subline">
++    <span class="score" id="score_40123456">256 points</span>
++    by <a href="user?id=alice" class="hnuser">alice</a>
++    <span class="age" title="2024-01-01T00:00:00">
++      <a href="item?id=40123456">3 hours ago</a></span>
++    | <a href="hide?id=40123456">hide</a>
++    | <a href="item?id=40123456">142&nbsp;comments</a>
++  </span></td></tr>
++
++  <tr class='athing' id='40999999'>
++    <td align="right" valign="top" class="title"><span class="rank">2.</span></td>
++    <td valign="top" class="votelinks">
++      <center><a id='up_40999999' href='vote?id=40999999&how=up'>
++        <div class='votearrow' title='upvote'></div></a></center>
++    </td>
++    <td class="title"><span class="titleline">
++      <a href="item?id=40999999">Ask HN: What are you working on?</a>
++    </span></td>
++  </tr>
++  <tr><td colspan="2"></td><td class="subtext"><span class="subline">
++    <span class="score" id="score_40999999">42 points</span>
++    by <a href="user?id=bob" class="hnuser">bob</a>
++    <span class="age" title="2024-01-01T00:00:00">
++      <a href="item?id=40999999">1 hour ago</a></span>
++    | <a href="item?id=40999999">7&nbsp;comments</a>
++  </span></td></tr>
++</table></body></html>
++"""
++
++
++def test_parse_frontpage_extracts_metadata():
++    """Discovery layer extracts rank, title, absolute URL, and comment count."""
++    articles = parse_frontpage(HN_FIXTURE)
++    assert len(articles) == 2
++
++    first = articles[0]
++    assert first.rank == 1
++    assert first.title == "A Great Article"
++    # Relative-free, fully absolute external URL.
++    assert first.url == "https://example.com/great-article"
++    assert first.comments == 142
++    assert first.source_id == "40123456"
++    assert first.points == 256
++    assert first.author == "alice"
++    assert first.hn_url == "https://news.ycombinator.com/item?id=40123456"
++
++    # The internal "Ask HN" link is resolved to an absolute HN item URL.
++    second = articles[1]
++    assert second.rank == 2
++    assert second.url == "https://news.ycombinator.com/item?id=40999999"
++    assert second.comments == 7
++
++    # Candidate filtering keeps only the external story.
++    external = filter_external(articles)
++    assert len(external) == 1
++    assert external[0].url == "https://example.com/great-article"
++
++
++def test_validate_articles_flags_unknown_source_id():
++    """Validation layer drops and warns about an unknown source_id."""
++    known_source_ids = {"40123456", "40999999"}
++
++    good = ArticleContent(
++        source_id="40123456",
++        title="A Great Article",
++        url="https://example.com/great-article",
++        text="Real extracted body text for the first article.",
++    )
++    suspect = ArticleContent(
++        source_id="40999999",
++        title="Second Article",
++        url="https://example.org/second",
++        text="Real extracted body text for the second article.",
++    )
++    # Corrupt the second record's source_id to an unknown value.
++    suspect.source_id = "unknown"
++
++    valid, warnings = validate_articles([good, suspect], known_source_ids)
++
++    assert len(valid) == 1
++    assert valid[0].source_id == "40123456"
++    assert any("unknown" in warning.lower() for warning in warnings)
++
++
++def test_dedup_skips_seen_candidates(tmp_path):
++    """Deduplication drops previously seen candidates and round-trips IDs."""
++    candidates = parse_frontpage(HN_FIXTURE)  # source_ids 40123456 and 40999999
++    seen_path = tmp_path / "seen_articles.json"
++
++    # A missing file behaves as "nothing seen yet": all candidates are fresh.
++    assert load_seen_ids(str(seen_path)) == set()
++    assert len(filter_unseen(candidates, set())) == 2
++
++    # Persist one processed ID, then read it back and confirm it is skipped.
++    save_seen_ids({"40123456"}, str(seen_path))
++    seen = load_seen_ids(str(seen_path))
++    assert seen == {"40123456"}
++
++    fresh = filter_unseen(candidates, seen)
++    assert [candidate.source_id for candidate in fresh] == ["40999999"]

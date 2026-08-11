@@ -1,0 +1,14 @@
+commit 627a7b74bfc4833aaebca2e5f1c8c74147f932e8 (HEAD -> master)
+Author:     Gabriel Facco Bettinelli <bettipb@gmail.com>
+AuthorDate: Tue Jul 14 11:02:05 2026 -0700
+Commit:     Gabriel Facco Bettinelli <bettipb@gmail.com>
+CommitDate: Tue Jul 14 11:02:05 2026 -0700
+
+    Base commit
+
+ .env.example     | 2 ++
+ .gitignore       | 4 ++++
+ main.py          | 0
+ requirements.txt | 0
+ tests_main.py    | 0
+ 5 files changed, 6 insertions(+)

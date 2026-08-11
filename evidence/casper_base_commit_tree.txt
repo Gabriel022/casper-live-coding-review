@@ -1,0 +1,5 @@
+100644 blob 2870c63cec9f267a99cab22e313e992272fd2e1f      59	.env.example
+100644 blob 8800ca5449b2ebb9f2fa35966cb46fbe2ffe45a9      32	.gitignore
+100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391       0	main.py
+100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391       0	requirements.txt
+100644 blob e69de29bb2d1d6434b8b29ae775ad8c2e48c5391       0	tests_main.py
