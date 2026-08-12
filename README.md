@@ -20,6 +20,22 @@ The implementation was then built during the live interview.
 
 Supporting Git evidence is available in the evidence/ directory. The complete original repository state is preserved separately in the evidence archive.
 
+
+## Original architecture notes from the live interview
+
+After the initial evidence package was prepared, I located the original `architectural_notes.md` file that I created and edited during the July 14 live interview. It had been saved outside the project repository, which is why it was not included in the initial preserved project archive.
+
+Original file metadata:
+
+- Created: July 14, 2026 at 10:46:49 AM
+- Last written: July 14, 2026 at 10:59:34 AM
+- Size: 3,728 bytes
+- SHA256: `7df16cd28b761f5bd522a324fc132a050b8c644921d2cd2fa7477896e22438af`
+
+The interview transcript independently records me creating "Architectural Notes" at approximately the same time and then defining the architecture, data contracts, validation boundaries, dependencies, and test requirements before implementation began.
+
+The copy in `evidence/architectural_notes_20260714.md` is an unchanged copy of that recovered original file. The original file remains preserved separately.
+
 ## What I built
 
 The solution is an end-to-end Hacker News research pipeline:
@@ -113,6 +129,7 @@ The evidence/ directory contains:
 - casper_base_commit_tree.txt
 - casper_interview_final_vs_base.patch
 - casper_evidence_sha256.txt
+- architectural_notes_20260714.md - unchanged copy of the original architecture notes created during the July 14 live interview
 
 These files were generated from the preserved original repository before this review repository was created.
 
